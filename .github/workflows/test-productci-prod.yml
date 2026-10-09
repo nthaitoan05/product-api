@@ -245,7 +245,7 @@ jobs:
             process.exit(1);
           });
           NODE
-          
+
       - name: Verify health before publishing
         if: ${{ success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
         run: |
@@ -306,4 +306,91 @@ jobs:
           if docker volume inspect productapi-ci-data \
             > /dev/null 2>&1; then
             docker volume rm productapi-ci-data
+          fi
+
+  deploy-local:
+    name: Deploy to Local Docker Engine
+    needs: test-production
+    if: ${{ success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+    runs-on: [self-hosted, Windows, X64, product-api-local]
+    timeout-minutes: 10
+
+    concurrency:
+      group: product-api-local-deploy
+      cancel-in-progress: false
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      PRODUCT_API_IMAGE: thaitoan005/product-api:sha-${{ github.sha }}
+      LOCAL_ENV_FILE: /c/Users/ASUS/MSA-Practice/product-api/.env
+
+    steps:
+      - name: Checkout deployment configuration
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check local Docker Engine
+        run: |
+          docker version
+          docker compose version
+
+          test "$(docker info --format '{{.OSType}}')" = "linux"
+
+      - name: Prepare local environment
+        run: |
+          if [ ! -f "$LOCAL_ENV_FILE" ]; then
+            echo "Local .env file was not found"
+            exit 1
+          fi
+
+          cp "$LOCAL_ENV_FILE" .env
+
+          docker compose -p product-api \
+            -f docker-compose-prod.yaml config --quiet
+
+      - name: Pull image published by CI
+        run: |
+          docker compose -p product-api \
+            -f docker-compose-prod.yaml pull api
+
+      - name: Deploy and wait for healthchecks
+        run: |
+          docker compose -p product-api \
+            -f docker-compose-prod.yaml up \
+            -d --no-build --wait --wait-timeout 180
+
+      - name: Verify deployed image and API health
+        run: |
+          actual_image="$(docker inspect product-api \
+            --format '{{.Config.Image}}')"
+
+          echo "Deployed image: $actual_image"
+          test "$actual_image" = "$PRODUCT_API_IMAGE"
+
+          test "$(docker inspect nammongodb \
+            --format '{{.State.Health.Status}}')" = "healthy"
+
+          test "$(docker inspect product-api \
+            --format '{{.State.Health.Status}}')" = "healthy"
+
+          curl --fail --silent --show-error --max-time 5 \
+            http://127.0.0.1:3000/health
+
+          echo
+          echo "Local deployment succeeded"
+
+      - name: Show local container status and logs
+        if: always()
+        run: |
+          if [ -f .env ]; then
+            docker compose -p product-api \
+              -f docker-compose-prod.yaml ps --all
+
+            docker compose -p product-api \
+              -f docker-compose-prod.yaml logs \
+              --no-color --tail=50
           fi

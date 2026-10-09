@@ -22,7 +22,7 @@ services:
     restart: unless-stopped
 
   api:
-    image: thaitoan005/product-api:latest
+    image: ${PRODUCT_API_IMAGE:-thaitoan005/product-api:latest}
     container_name: product-api
     env_file:
       - .env
