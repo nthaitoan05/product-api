@@ -1,0 +1,157 @@
+name: Product API CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      HOST: "127.0.0.1"
+      PORT: "3000"
+      MONGODB_URI: "mongodb://127.0.0.1:27017/productdb_ci"
+
+    services:
+      mongodb:
+        image: mongo:8.0
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 10s
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Start API
+        run: node server.js > api.log 2>&1 &
+
+      - name: Wait for API
+        run: |
+          for attempt in {1..30}; do
+            if curl --fail --silent --max-time 2 \
+              http://127.0.0.1:3000/health > /dev/null; then
+              echo "API is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "API did not become ready"
+          exit 1
+
+      - name: Test healthcheck and CRUD
+        run: |
+          node <<'NODE'
+          const assert = require("node:assert/strict");
+
+          const baseUrl = "http://127.0.0.1:" + process.env.PORT;
+
+          async function request(path, method = "GET", data) {
+            const response = await fetch(baseUrl + path, {
+              method,
+              headers: { "Content-Type": "application/json" },
+              body: data === undefined ? undefined : JSON.stringify(data),
+              signal: AbortSignal.timeout(5000)
+            });
+
+            return {
+              status: response.status,
+              body: await response.json()
+            };
+          }
+
+          async function main() {
+            // Healthcheck
+            let result = await request("/health");
+            assert.equal(result.status, 200);
+            assert.equal(result.body.status, "healthy");
+            assert.equal(result.body.database, "connected");
+            console.log("PASS: Healthcheck");
+
+            const product = {
+              pid: "CI001",
+              pname: "Ban phim CI",
+              price: 250000,
+              quantity: 10
+            };
+
+            // Create
+            result = await request("/api/products", "POST", product);
+            assert.equal(result.status, 201);
+            assert.equal(result.body.pid, product.pid);
+            console.log("PASS: Create");
+
+            // Read
+            result = await request("/api/products/CI001");
+            assert.equal(result.status, 200);
+            assert.equal(result.body.pname, product.pname);
+            assert.equal(result.body.price, product.price);
+            assert.equal(result.body.quantity, product.quantity);
+            console.log("PASS: Read");
+
+            // Update, rồi đọc lại để xác nhận dữ liệu đã lưu
+            const updatedProduct = {
+              ...product,
+              price: 300000,
+              quantity: 15
+            };
+
+            result = await request(
+              "/api/products/CI001",
+              "PUT",
+              updatedProduct
+            );
+            assert.equal(result.status, 200);
+
+            result = await request("/api/products/CI001");
+            assert.equal(result.status, 200);
+            assert.equal(result.body.price, 300000);
+            assert.equal(result.body.quantity, 15);
+            console.log("PASS: Update");
+
+            // Delete, rồi tìm lại để xác nhận đã xóa
+            result = await request("/api/products/CI001", "DELETE");
+            assert.equal(result.status, 200);
+
+            result = await request("/api/products/CI001");
+            assert.equal(result.status, 404);
+            console.log("PASS: Delete");
+
+            console.log("All CI tests passed");
+          }
+
+          main().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Show API logs
+        if: always()
+        run: |
+          if [ -f api.log ]; then
+            cat api.log
+          fi
