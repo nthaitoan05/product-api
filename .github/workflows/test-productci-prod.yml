@@ -1,0 +1,269 @@
+name: Product API Production CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-production:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js for test script
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Prepare CI environment
+        run: |
+          cat > .env <<'ENV'
+          HOST=0.0.0.0
+          PORT=3000
+          NODE_ENV=production
+          MONGODB_URI=mongodb://nammongodb:27017/productdb_ci
+          MONGO_DATA_VOLUME=productapi-ci-data
+          ENV
+
+          docker volume create productapi-ci-data
+          docker compose version
+          docker compose -p product-api-ci config --quiet
+
+      - name: Build and start API with MongoDB
+        run: |
+          docker compose -p product-api-ci up \
+            --build --wait --wait-timeout 180
+
+          docker compose -p product-api-ci ps
+
+      - name: Test deployed API and MongoDB
+        run: |
+          node <<'NODE'
+          const assert = require("node:assert/strict");
+          const { execFileSync } = require("node:child_process");
+
+          const baseUrl = "http://127.0.0.1:3000";
+          const productPath = "/api/products";
+
+          async function request(path, method = "GET", data) {
+            const response = await fetch(baseUrl + path, {
+              method,
+              headers: { "Content-Type": "application/json" },
+              body: data === undefined
+                ? undefined
+                : JSON.stringify(data),
+              signal: AbortSignal.timeout(5000)
+            });
+
+            return {
+              status: response.status,
+              body: await response.json()
+            };
+          }
+
+          function checkProduct(actual, expected) {
+            assert.equal(actual.pid, expected.pid);
+            assert.equal(actual.pname, expected.pname);
+            assert.equal(actual.price, expected.price);
+            assert.equal(actual.quantity, expected.quantity);
+          }
+
+          function readFromMongoDB(pid) {
+            const query =
+              "JSON.stringify(db.products.findOne(" +
+              "{pid:" + JSON.stringify(pid) + "}, {_id:0}))";
+
+            const output = execFileSync("docker", [
+              "compose", "-p", "product-api-ci",
+              "exec", "-T", "mongodb",
+              "mongosh", "--quiet", "productdb_ci",
+              "--eval", query
+            ], {
+              encoding: "utf8",
+              timeout: 15000
+            });
+
+            return JSON.parse(output.trim());
+          }
+
+          async function main() {
+            let result = await request("/health");
+            assert.equal(result.status, 200);
+            assert.equal(result.body.status, "healthy");
+            assert.equal(result.body.database, "connected");
+            console.log("PASS: Healthcheck");
+
+            const product = {
+              pid: "CI_PROD_001",
+              pname: "Ban phim test",
+              price: 250000,
+              quantity: 10
+            };
+
+            // CREATE: tạo sản phẩm.
+            result = await request(productPath, "POST", product);
+            assert.equal(result.status, 201);
+            checkProduct(result.body, product);
+
+            // Kiểm tra trực tiếp dữ liệu đã lưu trong MongoDB.
+            checkProduct(readFromMongoDB(product.pid), product);
+            console.log("PASS: Create and MongoDB persistence");
+
+            // PID trùng phải bị từ chối.
+            result = await request(productPath, "POST", product);
+            assert.equal(result.status, 409);
+            console.log("PASS: Duplicate PID rejected");
+
+            // READ: lấy danh sách và chi tiết.
+            result = await request(productPath);
+            assert.equal(result.status, 200);
+            assert.ok(Array.isArray(result.body));
+
+            const found = result.body.find(
+              item => item.pid === product.pid
+            );
+            assert.ok(found, "Product must appear in the list");
+            checkProduct(found, product);
+
+            const detailPath = productPath + "/" + product.pid;
+            result = await request(detailPath);
+            assert.equal(result.status, 200);
+            checkProduct(result.body, product);
+            console.log("PASS: Read list and detail");
+
+            // UPDATE: cập nhật và đọc lại để xác nhận.
+            const updatedProduct = {
+              ...product,
+              pname: "Ban phim updated",
+              price: 300000,
+              quantity: 15
+            };
+
+            result = await request(
+              detailPath, "PUT", updatedProduct
+            );
+            assert.equal(result.status, 200);
+            checkProduct(result.body, updatedProduct);
+
+            result = await request(detailPath);
+            assert.equal(result.status, 200);
+            checkProduct(result.body, updatedProduct);
+            checkProduct(
+              readFromMongoDB(product.pid), updatedProduct
+            );
+            console.log("PASS: Update and MongoDB persistence");
+
+            // Dữ liệu không hợp lệ phải trả về 400.
+            const invalidProducts = [
+              {
+                pid: "CI_INVALID",
+                price: 100000,
+                quantity: 1
+              },
+              {
+                ...product,
+                pid: "CI_INVALID",
+                price: -1
+              },
+              {
+                ...product,
+                pid: "CI_INVALID",
+                quantity: -1
+              },
+              {
+                ...product,
+                pid: "CI_INVALID",
+                quantity: 1.5
+              }
+            ];
+
+            for (const invalidProduct of invalidProducts) {
+              result = await request(
+                productPath, "POST", invalidProduct
+              );
+              assert.equal(result.status, 400);
+            }
+
+            // Cập nhật sai cũng phải bị từ chối.
+            result = await request(detailPath, "PUT", {
+              ...updatedProduct,
+              price: -1
+            });
+            assert.equal(result.status, 400);
+
+            // Dữ liệu cũ phải còn nguyên sau cập nhật lỗi.
+            result = await request(detailPath);
+            assert.equal(result.status, 200);
+            checkProduct(result.body, updatedProduct);
+            console.log("PASS: Invalid data rejected");
+
+            // Sản phẩm không tồn tại phải trả về 404.
+            const missingPath = productPath + "/CI_NOT_FOUND";
+
+            result = await request(missingPath);
+            assert.equal(result.status, 404);
+
+            result = await request(
+              missingPath, "PUT", updatedProduct
+            );
+            assert.equal(result.status, 404);
+
+            result = await request(missingPath, "DELETE");
+            assert.equal(result.status, 404);
+            console.log("PASS: Missing product returns 404");
+
+            // DELETE: xóa và xác nhận MongoDB đã xóa.
+            result = await request(detailPath, "DELETE");
+            assert.equal(result.status, 200);
+
+            result = await request(detailPath);
+            assert.equal(result.status, 404);
+            assert.equal(readFromMongoDB(product.pid), null);
+
+            result = await request(productPath);
+            assert.equal(result.status, 200);
+            assert.ok(
+              !result.body.some(item => item.pid === product.pid)
+            );
+            console.log("PASS: Delete and MongoDB persistence");
+
+            console.log("All production CI tests passed");
+          }
+
+          main().catch(error => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Show container status and logs
+        if: always()
+        run: |
+          if [ -f .env ]; then
+            docker compose -p product-api-ci ps --all
+            docker compose -p product-api-ci logs \
+              --no-color --tail=100
+          fi
+
+      - name: Clean up CI containers and volumes
+        if: always()
+        run: |
+          if [ -f .env ]; then
+            docker compose -p product-api-ci down \
+              --volumes --remove-orphans
+          fi
+
+          if docker volume inspect productapi-ci-data \
+            > /dev/null 2>&1; then
+            docker volume rm productapi-ci-data
+          fi
