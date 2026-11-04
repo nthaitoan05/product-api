@@ -246,6 +246,34 @@ jobs:
           });
           NODE
 
+      - name: Test API theo yeu cau
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+
+          async function request(method, path, body) {
+            const response = await fetch("http://localhost:3000" + path, {
+              method,
+              headers: { "Content-Type": "application/json" },
+              body: body === undefined ? undefined : JSON.stringify(body),
+              signal: AbortSignal.timeout(5000)
+            });
+
+            return {
+              status: response.status,
+              data: await response.json()
+            };
+          }
+          
+          // ===== VIẾT TEST THEO YÊU CẦU TẠI ĐÂY =====
+          throw new Error("Chua dien noi dung test");
+          // ===== KẾT THÚC PHẦN TEST =====
+
+          console.log("PASS: API test");
+          NODE
+      
+    
+
       - name: Verify health before publishing
         if: ${{ success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
         run: |
@@ -394,3 +422,5 @@ jobs:
               -f docker-compose-prod.yaml logs \
               --no-color --tail=50
           fi
+      
+
