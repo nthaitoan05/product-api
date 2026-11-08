@@ -2,7 +2,7 @@ name: product-api
 
 services:
   mongodb:
-    image: mongo:8.0
+    image: ${MONGO_IMAGE:-mongo:8.0}
     container_name: nammongodb
     ports:
       - "127.0.0.1:27017:27017"
