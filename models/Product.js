@@ -24,7 +24,7 @@ const productSchema = new mongoose.Schema(
     },
     quantity: {
       type: Number,
-      required: true,
+      required: false,
       min: 1,
       validate: {
         validator: Number.isInteger,

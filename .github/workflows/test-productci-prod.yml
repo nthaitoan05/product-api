@@ -107,7 +107,7 @@ jobs:
             const product = {
               pid: "CI_PROD_001",
               pname: "Ban phim test",
-              price: 250000,
+              price: 25000,
               quantity: 10
             };
 
